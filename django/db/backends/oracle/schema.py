@@ -2,8 +2,8 @@ import copy
 import datetime
 import re
 
+from django.db import DatabaseError
 from django.db.backends.base.schema import BaseDatabaseSchemaEditor
-from django.db.utils import DatabaseError
 
 
 class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
@@ -121,6 +121,17 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         self.remove_field(model, old_field)
         # Rename and possibly make the new field NOT NULL
         super().alter_field(model, new_temp_field, new_field)
+
+    def _alter_column_type_sql(self, model, old_field, new_field, new_type):
+        auto_field_types = {'AutoField', 'BigAutoField', 'SmallAutoField'}
+        # Drop the identity if migrating away from AutoField.
+        if (
+            old_field.get_internal_type() in auto_field_types and
+            new_field.get_internal_type() not in auto_field_types and
+            self._is_identity_column(model._meta.db_table, new_field.column)
+        ):
+            self._drop_identity(model._meta.db_table, new_field.column)
+        return super()._alter_column_type_sql(model, old_field, new_field, new_type)
 
     def normalize_name(self, name):
         """

@@ -1,7 +1,7 @@
 from django.db.backends.base.introspection import (
     BaseDatabaseIntrospection, FieldInfo, TableInfo,
 )
-from django.db.models.indexes import Index
+from django.db.models import Index
 
 
 class DatabaseIntrospection(BaseDatabaseIntrospection):
@@ -26,7 +26,10 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
         1266: 'TimeField',
         1700: 'DecimalField',
         2950: 'UUIDField',
+        3802: 'JSONField',
     }
+    # A hook for subclasses.
+    index_default_access_method = 'btree'
 
     ignored_tables = []
 
@@ -188,7 +191,7 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
                             pg_get_indexdef(idx.indexrelid)
                     END AS exprdef,
                     CASE am.amname
-                        WHEN 'btree' THEN
+                        WHEN %s THEN
                             CASE (option & 1)
                                 WHEN 1 THEN 'DESC' ELSE 'ASC'
                             END
@@ -205,10 +208,15 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
                 WHERE c.relname = %s AND pg_catalog.pg_table_is_visible(c.oid)
             ) s2
             GROUP BY indexname, indisunique, indisprimary, amname, exprdef, attoptions;
-        """, [table_name])
+        """, [self.index_default_access_method, table_name])
         for index, columns, unique, primary, orders, type_, definition, options in cursor.fetchall():
             if index not in constraints:
-                basic_index = type_ == 'btree' and not index.endswith('_btree') and options is None
+                basic_index = (
+                    type_ == self.index_default_access_method and
+                    # '_btree' references
+                    # django.contrib.postgres.indexes.BTreeIndex.suffix.
+                    not index.endswith('_btree') and options is None
+                )
                 constraints[index] = {
                     "columns": columns if columns != [None] else [],
                     "orders": orders if orders != [None] else [],

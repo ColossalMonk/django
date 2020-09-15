@@ -12,10 +12,6 @@ from django import forms
 from django.apps import apps
 from django.conf import settings
 from django.core import checks, exceptions, validators
-# When the _meta object was formalized, this exception was moved to
-# django.core.exceptions. It is retained here for backwards compatibility
-# purposes.
-from django.core.exceptions import FieldDoesNotExist  # NOQA
 from django.db import connection, connections, router
 from django.db.models.constants import LOOKUP_SEP
 from django.db.models.query_utils import DeferredAttribute, RegisterLookupMixin
@@ -35,9 +31,9 @@ __all__ = [
     'AutoField', 'BLANK_CHOICE_DASH', 'BigAutoField', 'BigIntegerField',
     'BinaryField', 'BooleanField', 'CharField', 'CommaSeparatedIntegerField',
     'DateField', 'DateTimeField', 'DecimalField', 'DurationField',
-    'EmailField', 'Empty', 'Field', 'FieldDoesNotExist', 'FilePathField',
-    'FloatField', 'GenericIPAddressField', 'IPAddressField', 'IntegerField',
-    'NOT_PROVIDED', 'NullBooleanField', 'PositiveIntegerField',
+    'EmailField', 'Empty', 'Field', 'FilePathField', 'FloatField',
+    'GenericIPAddressField', 'IPAddressField', 'IntegerField', 'NOT_PROVIDED',
+    'NullBooleanField', 'PositiveBigIntegerField', 'PositiveIntegerField',
     'PositiveSmallIntegerField', 'SlugField', 'SmallAutoField',
     'SmallIntegerField', 'TextField', 'TimeField', 'URLField', 'UUIDField',
 ]
@@ -225,7 +221,7 @@ class Field(RegisterLookupMixin):
         elif LOOKUP_SEP in self.name:
             return [
                 checks.Error(
-                    'Field names must not contain "%s".' % (LOOKUP_SEP,),
+                    'Field names must not contain "%s".' % LOOKUP_SEP,
                     obj=self,
                     id='fields.E002',
                 )
@@ -241,14 +237,15 @@ class Field(RegisterLookupMixin):
         else:
             return []
 
+    @classmethod
+    def _choices_is_value(cls, value):
+        return isinstance(value, (str, Promise)) or not is_iterable(value)
+
     def _check_choices(self):
         if not self.choices:
             return []
 
-        def is_value(value, accept_promise=True):
-            return isinstance(value, (str, Promise) if accept_promise else str) or not is_iterable(value)
-
-        if is_value(self.choices, accept_promise=False):
+        if not is_iterable(self.choices) or isinstance(self.choices, str):
             return [
                 checks.Error(
                     "'choices' must be an iterable (e.g., a list or tuple).",
@@ -257,6 +254,7 @@ class Field(RegisterLookupMixin):
                 )
             ]
 
+        choice_max_length = 0
         # Expect [group_name, [value, display]]
         for choices_group in self.choices:
             try:
@@ -266,20 +264,36 @@ class Field(RegisterLookupMixin):
                 break
             try:
                 if not all(
-                    is_value(value) and is_value(human_name)
+                    self._choices_is_value(value) and self._choices_is_value(human_name)
                     for value, human_name in group_choices
                 ):
                     break
+                if self.max_length is not None and group_choices:
+                    choice_max_length = max([
+                        choice_max_length,
+                        *(len(value) for value, _ in group_choices if isinstance(value, str)),
+                    ])
             except (TypeError, ValueError):
                 # No groups, choices in the form [value, display]
                 value, human_name = group_name, group_choices
-                if not is_value(value) or not is_value(human_name):
+                if not self._choices_is_value(value) or not self._choices_is_value(human_name):
                     break
+                if self.max_length is not None and isinstance(value, str):
+                    choice_max_length = max(choice_max_length, len(value))
 
             # Special case: choices=['ab']
             if isinstance(choices_group, str):
                 break
         else:
+            if self.max_length is not None and choice_max_length > self.max_length:
+                return [
+                    checks.Error(
+                        "'max_length' is too small to fit the longest value "
+                        "in 'choices' (%d characters)." % choice_max_length,
+                        obj=self,
+                        id='fields.E009',
+                    ),
+                ]
             return []
 
         return [
@@ -321,12 +335,15 @@ class Field(RegisterLookupMixin):
         else:
             return []
 
-    def _check_backend_specific_checks(self, **kwargs):
+    def _check_backend_specific_checks(self, databases=None, **kwargs):
+        if databases is None:
+            return []
         app_label = self.model._meta.app_label
-        for db in connections:
-            if router.allow_migrate(db, app_label, model_name=self.model._meta.model_name):
-                return connections[db].validation.check_field(self, **kwargs)
-        return []
+        errors = []
+        for alias in databases:
+            if router.allow_migrate(alias, app_label, model_name=self.model._meta.model_name):
+                errors.extend(connections[alias].validation.check_field(self, **kwargs))
+        return errors
 
     def _check_validators(self):
         errors = []
@@ -479,6 +496,8 @@ class Field(RegisterLookupMixin):
             path = path.replace("django.db.models.fields.related", "django.db.models")
         elif path.startswith("django.db.models.fields.files"):
             path = path.replace("django.db.models.fields.files", "django.db.models")
+        elif path.startswith('django.db.models.fields.json'):
+            path = path.replace('django.db.models.fields.json', 'django.db.models')
         elif path.startswith("django.db.models.fields.proxy"):
             path = path.replace("django.db.models.fields.proxy", "django.db.models")
         elif path.startswith("django.db.models.fields"):
@@ -497,17 +516,37 @@ class Field(RegisterLookupMixin):
     def __eq__(self, other):
         # Needed for @total_ordering
         if isinstance(other, Field):
-            return self.creation_counter == other.creation_counter
+            return (
+                self.creation_counter == other.creation_counter and
+                getattr(self, 'model', None) == getattr(other, 'model', None)
+            )
         return NotImplemented
 
     def __lt__(self, other):
         # This is needed because bisect does not take a comparison function.
+        # Order by creation_counter first for backward compatibility.
         if isinstance(other, Field):
-            return self.creation_counter < other.creation_counter
+            if (
+                self.creation_counter != other.creation_counter or
+                not hasattr(self, 'model') and not hasattr(other, 'model')
+            ):
+                return self.creation_counter < other.creation_counter
+            elif hasattr(self, 'model') != hasattr(other, 'model'):
+                return not hasattr(self, 'model')  # Order no-model fields first
+            else:
+                # creation_counter's are equal, compare only models.
+                return (
+                    (self.model._meta.app_label, self.model._meta.model_name) <
+                    (other.model._meta.app_label, other.model._meta.model_name)
+                )
         return NotImplemented
 
     def __hash__(self):
-        return hash(self.creation_counter)
+        return hash((
+            self.creation_counter,
+            self.model._meta.app_label if hasattr(self, 'model') else None,
+            self.model._meta.model_name if hasattr(self, 'model') else None,
+        ))
 
     def __deepcopy__(self, memodict):
         # We don't have to deepcopy very much here, since most things are not
@@ -718,6 +757,14 @@ class Field(RegisterLookupMixin):
     def db_tablespace(self):
         return self._db_tablespace or settings.DEFAULT_INDEX_TABLESPACE
 
+    @property
+    def db_returning(self):
+        """
+        Private API intended only to be used by Django itself. Currently only
+        the PostgreSQL backend supports returning multiple fields on a model.
+        """
+        return False
+
     def set_attributes_from_name(self, name):
         self.name = self.name or name
         self.attname, self.column = self.get_attname_column()
@@ -742,8 +789,16 @@ class Field(RegisterLookupMixin):
             if not getattr(cls, self.attname, None):
                 setattr(cls, self.attname, self.descriptor_class(self))
         if self.choices is not None:
-            setattr(cls, 'get_%s_display' % self.name,
-                    partialmethod(cls._get_FIELD_display, field=self))
+            # Don't override a get_FOO_display() method defined explicitly on
+            # this class, but don't check methods derived from inheritance, to
+            # allow overriding inherited choices. For more complex inheritance
+            # structures users should override contribute_to_class().
+            if 'get_%s_display' % self.name not in cls.__dict__:
+                setattr(
+                    cls,
+                    'get_%s_display' % self.name,
+                    partialmethod(cls._get_FIELD_display, field=self),
+                )
 
     def get_filter_kwargs_for_object(self, obj):
         """
@@ -896,110 +951,6 @@ class Field(RegisterLookupMixin):
     def value_from_object(self, obj):
         """Return the value of this field in the given model instance."""
         return getattr(obj, self.attname)
-
-
-class AutoField(Field):
-    description = _("Integer")
-
-    empty_strings_allowed = False
-    default_error_messages = {
-        'invalid': _('“%(value)s” value must be an integer.'),
-    }
-
-    def __init__(self, *args, **kwargs):
-        kwargs['blank'] = True
-        super().__init__(*args, **kwargs)
-
-    def check(self, **kwargs):
-        return [
-            *super().check(**kwargs),
-            *self._check_primary_key(),
-        ]
-
-    def _check_primary_key(self):
-        if not self.primary_key:
-            return [
-                checks.Error(
-                    'AutoFields must set primary_key=True.',
-                    obj=self,
-                    id='fields.E100',
-                ),
-            ]
-        else:
-            return []
-
-    def deconstruct(self):
-        name, path, args, kwargs = super().deconstruct()
-        del kwargs['blank']
-        kwargs['primary_key'] = True
-        return name, path, args, kwargs
-
-    def get_internal_type(self):
-        return "AutoField"
-
-    def to_python(self, value):
-        if value is None:
-            return value
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            raise exceptions.ValidationError(
-                self.error_messages['invalid'],
-                code='invalid',
-                params={'value': value},
-            )
-
-    def rel_db_type(self, connection):
-        return IntegerField().db_type(connection=connection)
-
-    def validate(self, value, model_instance):
-        pass
-
-    def get_db_prep_value(self, value, connection, prepared=False):
-        if not prepared:
-            value = self.get_prep_value(value)
-            value = connection.ops.validate_autopk_value(value)
-        return value
-
-    def get_prep_value(self, value):
-        from django.db.models.expressions import OuterRef
-        value = super().get_prep_value(value)
-        if value is None or isinstance(value, OuterRef):
-            return value
-        try:
-            return int(value)
-        except (TypeError, ValueError) as e:
-            raise e.__class__(
-                "Field '%s' expected a number but got %r." % (self.name, value),
-            ) from e
-
-    def contribute_to_class(self, cls, name, **kwargs):
-        assert not cls._meta.auto_field, "Model %s can't have more than one AutoField." % cls._meta.label
-        super().contribute_to_class(cls, name, **kwargs)
-        cls._meta.auto_field = self
-
-    def formfield(self, **kwargs):
-        return None
-
-
-class BigAutoField(AutoField):
-    description = _("Big (8 byte) integer")
-
-    def get_internal_type(self):
-        return "BigAutoField"
-
-    def rel_db_type(self, connection):
-        return BigIntegerField().db_type(connection=connection)
-
-
-class SmallAutoField(AutoField):
-    description = _('Small integer')
-
-    def get_internal_type(self):
-        return 'SmallAutoField'
-
-    def rel_db_type(self, connection):
-        return SmallIntegerField().db_type(connection=connection)
 
 
 class BooleanField(Field):
@@ -1570,7 +1521,7 @@ class DecimalField(Field):
             return self.context.create_decimal_from_float(value)
         try:
             return decimal.Decimal(value)
-        except decimal.InvalidOperation:
+        except (decimal.InvalidOperation, TypeError, ValueError):
             raise exceptions.ValidationError(
                 self.error_messages['invalid'],
                 code='invalid',
@@ -2000,6 +1951,14 @@ class NullBooleanField(BooleanField):
         'invalid_nullable': _('“%(value)s” value must be either None, True or False.'),
     }
     description = _("Boolean (Either True, False or None)")
+    system_check_deprecated_details = {
+        'msg': (
+            'NullBooleanField is deprecated. Support for it (except in '
+            'historical migrations) will be removed in Django 4.0.'
+        ),
+        'hint': 'Use BooleanField(null=True) instead.',
+        'id': 'fields.W903',
+    }
 
     def __init__(self, *args, **kwargs):
         kwargs['null'] = True
@@ -2031,6 +1990,19 @@ class PositiveIntegerRelDbTypeMixin:
             return self.db_type(connection)
         else:
             return IntegerField().db_type(connection=connection)
+
+
+class PositiveBigIntegerField(PositiveIntegerRelDbTypeMixin, IntegerField):
+    description = _('Positive big integer')
+
+    def get_internal_type(self):
+        return 'PositiveBigIntegerField'
+
+    def formfield(self, **kwargs):
+        return super().formfield(**{
+            'min_value': 0,
+            **kwargs,
+        })
 
 
 class PositiveIntegerField(PositiveIntegerRelDbTypeMixin, IntegerField):
@@ -2395,3 +2367,110 @@ class UUIDField(Field):
             'form_class': forms.UUIDField,
             **kwargs,
         })
+
+
+class AutoFieldMixin:
+    db_returning = True
+
+    def __init__(self, *args, **kwargs):
+        kwargs['blank'] = True
+        super().__init__(*args, **kwargs)
+
+    def check(self, **kwargs):
+        return [
+            *super().check(**kwargs),
+            *self._check_primary_key(),
+        ]
+
+    def _check_primary_key(self):
+        if not self.primary_key:
+            return [
+                checks.Error(
+                    'AutoFields must set primary_key=True.',
+                    obj=self,
+                    id='fields.E100',
+                ),
+            ]
+        else:
+            return []
+
+    def deconstruct(self):
+        name, path, args, kwargs = super().deconstruct()
+        del kwargs['blank']
+        kwargs['primary_key'] = True
+        return name, path, args, kwargs
+
+    def validate(self, value, model_instance):
+        pass
+
+    def get_db_prep_value(self, value, connection, prepared=False):
+        if not prepared:
+            value = self.get_prep_value(value)
+            value = connection.ops.validate_autopk_value(value)
+        return value
+
+    def contribute_to_class(self, cls, name, **kwargs):
+        assert not cls._meta.auto_field, (
+            "Model %s can't have more than one auto-generated field."
+            % cls._meta.label
+        )
+        super().contribute_to_class(cls, name, **kwargs)
+        cls._meta.auto_field = self
+
+    def formfield(self, **kwargs):
+        return None
+
+
+class AutoFieldMeta(type):
+    """
+    Metaclass to maintain backward inheritance compatibility for AutoField.
+
+    It is intended that AutoFieldMixin become public API when it is possible to
+    create a non-integer automatically-generated field using column defaults
+    stored in the database.
+
+    In many areas Django also relies on using isinstance() to check for an
+    automatically-generated field as a subclass of AutoField. A new flag needs
+    to be implemented on Field to be used instead.
+
+    When these issues have been addressed, this metaclass could be used to
+    deprecate inheritance from AutoField and use of isinstance() with AutoField
+    for detecting automatically-generated fields.
+    """
+
+    @property
+    def _subclasses(self):
+        return (BigAutoField, SmallAutoField)
+
+    def __instancecheck__(self, instance):
+        return isinstance(instance, self._subclasses) or super().__instancecheck__(instance)
+
+    def __subclasscheck__(self, subclass):
+        return subclass in self._subclasses or super().__subclasscheck__(subclass)
+
+
+class AutoField(AutoFieldMixin, IntegerField, metaclass=AutoFieldMeta):
+
+    def get_internal_type(self):
+        return 'AutoField'
+
+    def rel_db_type(self, connection):
+        return IntegerField().db_type(connection=connection)
+
+
+class BigAutoField(AutoFieldMixin, BigIntegerField):
+
+    def get_internal_type(self):
+        return 'BigAutoField'
+
+    def rel_db_type(self, connection):
+        return BigIntegerField().db_type(connection=connection)
+
+
+class SmallAutoField(AutoFieldMixin, SmallIntegerField):
+
+    def get_internal_type(self):
+        return 'SmallAutoField'
+
+    def rel_db_type(self, connection):
+        return SmallIntegerField().db_type(connection=connection)
